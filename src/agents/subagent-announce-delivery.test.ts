@@ -3467,7 +3467,7 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     });
   });
 
-  it("fails configured channel subagent completions when parent skips required message tool", async () => {
+  it("deterministically sends visible channel subagent completions when the announcer skips the message tool", async () => {
     const callGateway = createGatewayMock({
       result: {
         payloads: [{ text: "The subagent is done." }],
@@ -3500,9 +3500,30 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     });
 
     expectRecordFields(result, {
-      delivered: false,
+      delivered: true,
       path: "direct",
-      error: "completion agent did not use the message tool for message-tool-only delivery",
+    });
+    expect(callGateway).toHaveBeenCalledTimes(2);
+    expectGatewayAgentParams(callGateway, {
+      deliver: false,
+      channel: "slack",
+      accountId: "acct-1",
+      to: "channel:C123",
+      threadId: undefined,
+      sourceReplyDeliveryMode: "message_tool_only",
+    });
+    expectRecordFields(mockCallArg(callGateway, 1), { method: "message.action" });
+    expectRecordFields(mockCallArg(callGateway, 1).params, {
+      channel: "slack",
+      action: "send",
+      accountId: "acct-1",
+      sessionKey: "agent:main:slack:channel:C123",
+      idempotencyKey: "announce-channel-subagent-message-tool-missing:deterministic-message-tool",
+    });
+    expectRecordFields(mockCallArg(callGateway, 1).params.params, {
+      target: "channel:C123",
+      to: "channel:C123",
+      message: "The subagent is done.",
     });
   });
 

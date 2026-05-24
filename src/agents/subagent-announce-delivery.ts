@@ -672,6 +672,133 @@ function requiresAgentMediatedCompletionDelivery(params: {
   return params.expectsCompletionMessage && isAgentMediatedCompletionSourceTool(params.sourceTool);
 }
 
+function normalizeNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function appendUniqueNonEmptyStrings(values: unknown, output: string[], seen: Set<string>) {
+  const candidates = Array.isArray(values) ? values : [values];
+  for (const candidate of candidates) {
+    const normalized = normalizeNonEmptyString(candidate);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  }
+}
+
+type DeterministicMessageToolSendPayload = {
+  message?: string;
+  mediaUrl?: string;
+  mediaUrls?: string[];
+};
+
+function collectPayloadMediaUrls(
+  payload: Record<string, unknown>,
+  output: string[],
+  seen: Set<string>,
+) {
+  appendUniqueNonEmptyStrings(payload.mediaUrl, output, seen);
+  appendUniqueNonEmptyStrings(payload.mediaUrls, output, seen);
+  const attachments = payload.attachments;
+  if (!Array.isArray(attachments)) {
+    return;
+  }
+  for (const attachment of attachments) {
+    if (attachment && typeof attachment === "object" && !Array.isArray(attachment)) {
+      collectPayloadMediaUrls(attachment as Record<string, unknown>, output, seen);
+    }
+  }
+}
+
+function extractDeterministicMessageToolSendPayload(
+  response: unknown,
+): DeterministicMessageToolSendPayload | null {
+  const result = getGatewayAgentResult(response);
+  if (!result || !Array.isArray(result.payloads)) {
+    return null;
+  }
+  const textParts: string[] = [];
+  const mediaUrls: string[] = [];
+  const seenMediaUrls = new Set<string>();
+  for (const payload of result.payloads) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      continue;
+    }
+    const record = payload as Record<string, unknown>;
+    if (record.isError === true || record.isReasoning === true) {
+      continue;
+    }
+    const text = normalizeNonEmptyString(record.text);
+    if (text) {
+      textParts.push(text);
+    }
+    collectPayloadMediaUrls(record, mediaUrls, seenMediaUrls);
+  }
+  const message = textParts.join("\n").trim();
+  if (!message && mediaUrls.length === 0) {
+    return null;
+  }
+  return {
+    ...(message ? { message } : {}),
+    ...(mediaUrls.length === 1 ? { mediaUrl: mediaUrls[0] } : {}),
+    ...(mediaUrls.length > 1 ? { mediaUrls } : {}),
+  };
+}
+
+async function tryDeterministicMessageToolSend(params: {
+  response: unknown;
+  channel?: unknown;
+  accountId?: unknown;
+  to?: unknown;
+  threadId?: unknown;
+  sessionKey: string;
+  idempotencyKey: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}): Promise<boolean> {
+  if (params.signal?.aborted) {
+    return false;
+  }
+  const payload = extractDeterministicMessageToolSendPayload(params.response);
+  const channel = normalizeMessageChannel(normalizeNonEmptyString(params.channel));
+  const to = normalizeNonEmptyString(params.to);
+  if (!payload || !channel || !isDeliverableMessageChannel(channel) || !to) {
+    return false;
+  }
+  const accountId = normalizeNonEmptyString(params.accountId);
+  const threadId = normalizeNonEmptyString(params.threadId);
+  const idempotencyKey = `${params.idempotencyKey}:deterministic-message-tool`;
+  const messageActionParams: Record<string, unknown> = {
+    target: to,
+    to,
+    ...payload,
+    sessionKey: params.sessionKey,
+    idempotencyKey,
+    ...(accountId ? { accountId } : {}),
+    ...(threadId ? { threadId } : {}),
+  };
+
+  try {
+    await subagentAnnounceDeliveryDeps.dispatchGatewayMethodInProcess(
+      "message.action",
+      {
+        channel,
+        action: "send",
+        params: messageActionParams,
+        ...(accountId ? { accountId } : {}),
+        sessionKey: params.sessionKey,
+        idempotencyKey,
+      },
+      { timeoutMs: params.timeoutMs },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function collectExpectedMediaFromInternalEvents(
   events: AgentInternalEvent[] | undefined,
 ): string[] {
@@ -1370,6 +1497,42 @@ async function sendSubagentAnnounceDirectly(params: {
         });
         if (textDelivery) {
           return textDelivery;
+        }
+      }
+      if (expectedMediaUrls.length === 0) {
+        const deterministicTarget = deliveryTarget.deliver
+          ? {
+              channel: deliveryTarget.channel,
+              accountId: deliveryTarget.accountId,
+              to: deliveryTarget.to,
+              threadId: deliveryTarget.threadId,
+            }
+          : sessionOnlyOriginChannel && sessionOnlyOrigin?.to
+            ? {
+                channel: sessionOnlyOriginChannel,
+                accountId: sessionOnlyOrigin.accountId,
+                to: sessionOnlyOrigin.to,
+                threadId: stringifyRouteThreadId(sessionOnlyOrigin.threadId),
+              }
+            : undefined;
+        const deterministicDelivered = deterministicTarget
+          ? await tryDeterministicMessageToolSend({
+              response: directAnnounceResponse,
+              channel: deterministicTarget.channel,
+              accountId: deterministicTarget.accountId,
+              to: deterministicTarget.to,
+              threadId: deterministicTarget.threadId,
+              sessionKey: canonicalRequesterSessionKey,
+              idempotencyKey: params.directIdempotencyKey,
+              timeoutMs: announceTimeoutMs,
+              signal: params.signal,
+            })
+          : false;
+        if (deterministicDelivered) {
+          return {
+            delivered: true,
+            path: "direct",
+          };
         }
       }
       return {
