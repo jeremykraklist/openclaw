@@ -260,14 +260,19 @@ async function deliverTelegramDirectMessageCompletion(params: {
     to: "123456789",
     accountId: "bot-1",
   };
-  const requesterSessionKey = params.requesterSessionKey ?? "agent:main:telegram:123456789";
+  const requesterSessionKey = params.requesterSessionKey ?? "agent:main:telegram:direct:123456789";
   testing.setDepsForTest({
     callGateway: params.callGateway,
     getRequesterSessionActivity: () => ({
       sessionId: "requester-session-telegram",
       isActive: params.isActive === true,
     }),
-    getRuntimeConfig: () => ({}) as never,
+    getRuntimeConfig: () =>
+      ({
+        session: {
+          store: "/tmp/openclaw-subagent-announce-delivery-test-{agentId}-sessions.json",
+        },
+      }) as never,
     ...(params.queueEmbeddedPiMessageWithOutcome
       ? { queueEmbeddedPiMessageWithOutcome: params.queueEmbeddedPiMessageWithOutcome }
       : {}),
@@ -1416,7 +1421,7 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
 
   it("reports failure for Telegram DMs when announce-agent delivery fails", async () => {
     const callGateway = vi.fn(async () => {
-      throw new Error("UNAVAILABLE: requester wake failed");
+      throw new Error("requester wake failed");
     }) as unknown as typeof runtimeCallGateway;
     const sendMessage = createSendMessageMock();
     const result = await deliverTelegramDirectMessageCompletion({
@@ -1441,7 +1446,7 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expectRecordFields(result, {
       delivered: false,
       path: "direct",
-      error: "UNAVAILABLE: requester wake failed",
+      error: "requester wake failed",
     });
     expect(sendMessage).not.toHaveBeenCalled();
   });
@@ -2323,7 +2328,7 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  it("requires message-tool delivery for configured channel subagent completions", async () => {
+  it("deterministically sends visible channel subagent completions when the announcer skips the message tool", async () => {
     const callGateway = createGatewayMock({
       result: {
         payloads: [{ text: "The subagent is done." }],
@@ -2356,10 +2361,10 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     });
 
     expectRecordFields(result, {
-      delivered: false,
+      delivered: true,
       path: "direct",
-      error: "completion agent did not deliver through the message tool",
     });
+    expect(callGateway).toHaveBeenCalledTimes(2);
     expectGatewayAgentParams(callGateway, {
       deliver: false,
       channel: "slack",
@@ -2367,6 +2372,19 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
       to: "channel:C123",
       threadId: undefined,
       sourceReplyDeliveryMode: "message_tool_only",
+    });
+    expectRecordFields(mockCallArg(callGateway, 1), { method: "message.action" });
+    expectRecordFields(mockCallArg(callGateway, 1).params, {
+      channel: "slack",
+      action: "send",
+      accountId: "acct-1",
+      sessionKey: "agent:main:slack:channel:C123",
+      idempotencyKey: "announce-channel-subagent-message-tool:deterministic-message-tool",
+    });
+    expectRecordFields(mockCallArg(callGateway, 1).params.params, {
+      target: "channel:C123",
+      to: "channel:C123",
+      message: "The subagent is done.",
     });
   });
 
