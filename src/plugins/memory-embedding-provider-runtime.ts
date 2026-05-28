@@ -9,6 +9,7 @@ import {
   listRegisteredMemoryEmbeddingProviders,
   type MemoryEmbeddingProviderAdapter,
 } from "./memory-embedding-providers.js";
+import { resolveConfiguredProviderConfig } from "./provider-config-owner.js";
 
 export { listRegisteredMemoryEmbeddingProviders };
 
@@ -32,16 +33,8 @@ export function listMemoryEmbeddingProviders(
 }
 
 function readConfiguredProviderApiId(providerId: string, cfg?: OpenClawConfig): string | undefined {
-  const providers = cfg?.models?.providers;
-  if (!providers) {
-    return undefined;
-  }
   const normalized = normalizeProviderId(providerId);
-  const providerConfig =
-    providers[providerId] ??
-    Object.entries(providers).find(
-      ([candidateId]) => normalizeProviderId(candidateId) === normalized,
-    )?.[1];
+  const providerConfig = resolveConfiguredProviderConfig({ provider: providerId, config: cfg });
   const api = providerConfig?.api?.trim();
   if (!api) {
     return undefined;
