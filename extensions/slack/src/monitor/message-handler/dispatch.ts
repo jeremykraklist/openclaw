@@ -83,6 +83,7 @@ import type { SlackMessageEvent } from "../../types.js";
 import { normalizeSlackAllowOwnerEntry } from "../allow-list.js";
 import { resolveStorePath, updateLastRoute } from "../config.runtime.js";
 import { recordInboundSession } from "../conversation.runtime.js";
+import { SlackRetryableInboundError } from "../inbound-delivery-state.js";
 import { escapeSlackMrkdwn } from "../mrkdwn.js";
 import {
   createSlackReplyDeliveryPlan,
@@ -1953,6 +1954,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
     },
   );
   let handlerTimeoutFallbackDelivered = false;
+  let handlerTimeoutFallbackDeliveryFailed = false;
   if (
     dispatchError &&
     !anyReplyDeliveredBeforeFallback &&
@@ -1973,6 +1975,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
           });
         }
       } catch (fallbackError) {
+        handlerTimeoutFallbackDeliveryFailed = true;
         slackHandlerTimeoutFallbacks.delete(fallbackKey);
         runtime.error?.(
           danger(
@@ -2018,6 +2021,14 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
   }
 
   if (dispatchError) {
+    if (handlerTimeoutFallbackDeliveryFailed) {
+      throw new SlackRetryableInboundError(
+        `slack handler timeout fallback delivery failed; retry inbound message: ${formatErrorMessage(
+          dispatchError,
+        )}`,
+        { cause: dispatchError },
+      );
+    }
     throw dispatchError;
   }
 
