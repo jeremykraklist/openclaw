@@ -164,6 +164,40 @@ function copyProviderCatalogEntries(value: unknown): Array<[string, ModelProvide
   return entries.filter((entry): entry is [string, ModelProviderConfig] => isRecord(entry[1]));
 }
 
+function copyProviderPassthroughEntries(
+  provider: Record<string, unknown>,
+): Array<[string, unknown]> {
+  let keys: string[];
+  try {
+    keys = Object.keys(provider);
+  } catch {
+    return [];
+  }
+  const excluded = new Set([
+    "id",
+    "label",
+    "docsPath",
+    "aliases",
+    "envVars",
+    "auth",
+    "extraAuth",
+    "catalog",
+    "staticCatalog",
+  ]);
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys) {
+    if (excluded.has(key)) {
+      continue;
+    }
+    try {
+      entries.push([key, provider[key]]);
+    } catch {
+      continue;
+    }
+  }
+  return entries;
+}
+
 function copyProviderCatalogResultEntries(params: {
   providerId: string;
   result: ProviderCatalogResult;
@@ -300,22 +334,7 @@ export function defineSingleProviderPluginEntry(options: SingleProviderPluginOpt
           auth,
           catalog,
           ...(staticCatalog ? { staticCatalog } : {}),
-          ...Object.fromEntries(
-            Object.entries(provider).filter(
-              ([key]) =>
-                ![
-                  "id",
-                  "label",
-                  "docsPath",
-                  "aliases",
-                  "envVars",
-                  "auth",
-                  "extraAuth",
-                  "catalog",
-                  "staticCatalog",
-                ].includes(key),
-            ),
-          ),
+          ...Object.fromEntries(copyProviderPassthroughEntries(provider)),
         });
         api.registerModelCatalogProvider({
           provider: providerId,
