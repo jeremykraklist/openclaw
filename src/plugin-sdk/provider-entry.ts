@@ -1,3 +1,4 @@
+import type { ModelProviderConfig } from "../config/types.models.js";
 import type { UnifiedModelCatalogEntry } from "../model-catalog/types.js";
 import { createProviderApiKeyAuthMethod } from "../plugins/provider-api-key-auth.js";
 import type {
@@ -109,26 +110,91 @@ function resolveEnvVars(params: {
   return combined.length > 0 ? uniqueStrings(combined) : undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function readRecordValue(record: Record<string, unknown>, key: string): unknown {
+  try {
+    return record[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function copyArrayEntries(value: unknown): unknown[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  let length: number;
+  try {
+    length = value.length;
+  } catch {
+    return [];
+  }
+  const entries: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    try {
+      entries.push(value[index]);
+    } catch {
+      return [];
+    }
+  }
+  return entries;
+}
+
+function copyProviderCatalogEntries(value: unknown): Array<[string, ModelProviderConfig]> {
+  if (!isRecord(value)) {
+    return [];
+  }
+  let entries: Array<[string, unknown]>;
+  try {
+    entries = Object.entries(value);
+  } catch {
+    return [];
+  }
+  return entries.filter((entry): entry is [string, ModelProviderConfig] => isRecord(entry[1]));
+}
+
+function copyProviderCatalogResultEntries(params: {
+  providerId: string;
+  result: ProviderCatalogResult;
+}): Array<[string, ModelProviderConfig]> {
+  if (!isRecord(params.result)) {
+    return [];
+  }
+  const provider = readRecordValue(params.result, "provider");
+  if (isRecord(provider)) {
+    return [[params.providerId, provider as ModelProviderConfig]];
+  }
+  return copyProviderCatalogEntries(readRecordValue(params.result, "providers"));
+}
+
+function copyProviderModels(providerConfig: ModelProviderConfig): ModelProviderConfig["models"] {
+  return copyArrayEntries(
+    readRecordValue(providerConfig as Record<string, unknown>, "models"),
+  ).filter((entry): entry is ModelProviderConfig["models"][number] => isRecord(entry));
+}
+
 function projectProviderCatalogResultToUnifiedTextRows(params: {
   providerId: string;
   result: ProviderCatalogResult;
   source: UnifiedModelCatalogEntry["source"];
 }): UnifiedModelCatalogEntry[] {
-  if (!params.result) {
-    return [];
-  }
-  const providers =
-    "provider" in params.result
-      ? { [params.providerId]: params.result.provider }
-      : params.result.providers;
   const rows: UnifiedModelCatalogEntry[] = [];
-  for (const [providerId, providerConfig] of Object.entries(providers)) {
-    for (const model of providerConfig.models ?? []) {
+  for (const [providerId, providerConfig] of copyProviderCatalogResultEntries(params)) {
+    for (const model of copyProviderModels(providerConfig)) {
+      const modelRecord = model as Record<string, unknown>;
+      const modelId = readRecordValue(modelRecord, "id");
+      if (typeof modelId !== "string") {
+        continue;
+      }
+      const modelName = readRecordValue(modelRecord, "name");
       rows.push({
         kind: "text",
         provider: providerId,
-        model: model.id,
-        ...(model.name ? { label: model.name } : {}),
+        model: modelId,
+        ...(typeof modelName === "string" && modelName ? { label: modelName } : {}),
         source: params.source,
       });
     }
