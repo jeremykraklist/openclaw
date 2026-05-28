@@ -29,15 +29,15 @@ function model(provider: string, id: string): Model {
 describe("appendPrioritizedDynamicLiveModels", () => {
   it("materializes prioritized refs from provider dynamic model hooks", async () => {
     const resolveDynamicModel: DynamicModelResolver = vi.fn((params) =>
-      params.context.provider === "opencode-go" && params.context.modelId === "glm-5"
-        ? model("opencode-go", "glm-5")
+      params.context.provider === "test-dynamic" && params.context.modelId === "glm-5"
+        ? model("test-dynamic", "glm-5")
         : undefined,
     );
     const prepareDynamicModel: DynamicModelPreparer = vi.fn(async () => undefined);
     const config = {
       models: {
         providers: {
-          "opencode-go": {
+          "test-dynamic": {
             api: "openai-completions",
             baseUrl: "https://configured.example/v1",
             models: [],
@@ -53,42 +53,43 @@ describe("appendPrioritizedDynamicLiveModels", () => {
       modelRegistry: REGISTRY,
       resolveDynamicModel,
       prepareDynamicModel,
+      normalizeModel: (entry) => entry,
       refs: [
         { provider: "anthropic", id: "claude-sonnet-4-6" },
-        { provider: "opencode-go", id: "glm-5" },
+        { provider: "test-dynamic", id: "glm-5" },
       ],
     });
 
     expect(result.added.map((entry) => `${entry.provider}/${entry.id}`)).toEqual([
-      "opencode-go/glm-5",
+      "test-dynamic/glm-5",
     ]);
     expect(result.models.map((entry) => `${entry.provider}/${entry.id}`)).toEqual([
       "anthropic/claude-sonnet-4-6",
-      "opencode-go/glm-5",
+      "test-dynamic/glm-5",
     ]);
     expect(prepareDynamicModel).toHaveBeenCalledTimes(1);
     expect(prepareDynamicModel).toHaveBeenCalledWith(
       expect.objectContaining({
-        provider: "opencode-go",
+        provider: "test-dynamic",
         context: expect.objectContaining({
           agentDir: "/tmp/openclaw-agent",
           modelId: "glm-5",
           modelRegistry: REGISTRY,
-          provider: "opencode-go",
-          providerConfig: config.models?.providers?.["opencode-go"],
+          provider: "test-dynamic",
+          providerConfig: config.models?.providers?.["test-dynamic"],
         }),
       }),
     );
     expect(resolveDynamicModel).toHaveBeenCalledTimes(1);
     expect(resolveDynamicModel).toHaveBeenCalledWith(
       expect.objectContaining({
-        provider: "opencode-go",
+        provider: "test-dynamic",
         context: expect.objectContaining({
           agentDir: "/tmp/openclaw-agent",
           modelId: "glm-5",
           modelRegistry: REGISTRY,
-          provider: "opencode-go",
-          providerConfig: config.models?.providers?.["opencode-go"],
+          provider: "test-dynamic",
+          providerConfig: config.models?.providers?.["test-dynamic"],
         }),
       }),
     );

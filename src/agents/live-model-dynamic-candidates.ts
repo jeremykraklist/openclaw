@@ -28,10 +28,14 @@ export async function appendPrioritizedDynamicLiveModels(params: {
   modelRegistry: ProviderResolveDynamicModelContext["modelRegistry"];
   resolveDynamicModel?: DynamicModelResolver;
   prepareDynamicModel?: DynamicModelPreparer;
+  normalizeModel?: (model: Model) => Model;
   refs?: Array<{ provider: string; id: string }>;
 }): Promise<{ models: Model[]; added: Model[] }> {
   const resolveDynamicModel = params.resolveDynamicModel ?? runProviderDynamicModel;
   const prepareDynamicModel = params.prepareDynamicModel ?? prepareProviderDynamicModel;
+  const normalizeModel =
+    params.normalizeModel ??
+    ((model: Model): Model => normalizeDiscoveredAgentModel(model, params.agentDir));
   const refs = params.refs ?? listPrioritizedHighSignalLiveModelRefs();
   const seen = new Set<string>();
   for (const model of params.models) {
@@ -78,7 +82,7 @@ export async function appendPrioritizedDynamicLiveModels(params: {
     if (!resolved) {
       continue;
     }
-    const model = normalizeDiscoveredAgentModel(resolved as Model, params.agentDir);
+    const model = normalizeModel(resolved as Model);
     const resolvedKey = liveModelKey(model.provider, model.id);
     if (!resolvedKey || seen.has(resolvedKey)) {
       continue;
