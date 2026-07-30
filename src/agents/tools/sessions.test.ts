@@ -11,8 +11,10 @@ import { extractAssistantText, sanitizeTextContent } from "./chat-history-text.j
 
 const callGatewayMock = vi.fn();
 const embeddedRunMock = vi.hoisted(() => ({
+  abort: vi.fn(),
   queueMessage: vi.fn(),
   resolveActiveSessionId: vi.fn(),
+  waitForEnd: vi.fn(),
 }));
 const facadeRuntimeMock = vi.hoisted(() => ({
   sessionKeyResolvers: new Map<
@@ -35,8 +37,10 @@ vi.mock("../embedded-agent-runner/runs.js", async () => {
   );
   return {
     ...actual,
+    abortEmbeddedAgentRun: embeddedRunMock.abort,
     queueEmbeddedAgentMessageWithOutcomeAsync: embeddedRunMock.queueMessage,
     resolveActiveEmbeddedRunSessionId: embeddedRunMock.resolveActiveSessionId,
+    waitForEmbeddedAgentRunEnd: embeddedRunMock.waitForEnd,
   };
 });
 vi.mock("../../plugin-sdk/facade-runtime.js", async () => {
@@ -325,6 +329,8 @@ describe("sanitizeTextContent", () => {
 beforeEach(() => {
   embeddedRunMock.queueMessage.mockReset();
   embeddedRunMock.resolveActiveSessionId.mockReset();
+  embeddedRunMock.abort.mockReset();
+  embeddedRunMock.waitForEnd.mockReset();
   facadeRuntimeMock.sessionKeyResolvers.clear();
   loadConfigMock.mockReset();
   loadConfigMock.mockReturnValue({
@@ -879,6 +885,9 @@ describe("sessions_send gating", () => {
 
   it("interrupts and replaces an active run only when explicitly requested", async () => {
     const targetSessionKey = "agent:main:slack:channel:ops";
+    embeddedRunMock.resolveActiveSessionId.mockReturnValue("active-target-session-id");
+    embeddedRunMock.abort.mockReturnValue(true);
+    embeddedRunMock.waitForEnd.mockResolvedValue(true);
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string };
       if (request.method === "sessions.list") {
@@ -887,8 +896,8 @@ describe("sessions_send gating", () => {
           sessions: [{ key: targetSessionKey, kind: "group" }],
         };
       }
-      if (request.method === "sessions.steer") {
-        return { runId: "replacement-run", interruptedActiveRun: true };
+      if (request.method === "agent") {
+        return { runId: "replacement-run" };
       }
       throw new Error(`unexpected gateway method: ${request.method}`);
     });
@@ -919,14 +928,65 @@ describe("sessions_send gating", () => {
     });
     expect(callGatewayMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        method: "sessions.steer",
+        method: "agent",
         params: expect.objectContaining({
-          key: targetSessionKey,
           message: expect.stringContaining("stop the old task and do this instead"),
+          sessionKey: targetSessionKey,
         }),
       }),
     );
+    expect(embeddedRunMock.abort).toHaveBeenCalledWith("active-target-session-id");
+    expect(embeddedRunMock.waitForEnd).toHaveBeenCalledWith("active-target-session-id", 15_000);
     expect(embeddedRunMock.queueMessage).not.toHaveBeenCalled();
+  });
+
+  it("uses the gateway interrupt path when no embedded run is active", async () => {
+    const targetSessionKey = "agent:main:slack:channel:ops";
+    embeddedRunMock.resolveActiveSessionId.mockReturnValue(undefined);
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [{ key: targetSessionKey, kind: "group" }],
+        };
+      }
+      if (request.method === "sessions.steer") {
+        return { runId: "gateway-replacement-run", interruptedActiveRun: true };
+      }
+      throw new Error(`unexpected gateway method: ${request.method}`);
+    });
+    const tool = createSessionsSendTool({
+      agentSessionKey: MAIN_AGENT_SESSION_KEY,
+      agentChannel: MAIN_AGENT_CHANNEL,
+      config: {
+        session: { scope: "per-sender", mainKey: "main" },
+        tools: {
+          agentToAgent: { enabled: false },
+          sessions: { visibility: "all" },
+        },
+      } as never,
+      callGateway: callGatewayMock,
+    });
+
+    const result = await tool.execute("call-gateway-interrupt", {
+      sessionKey: targetSessionKey,
+      message: "replace the non-embedded run",
+      mode: "interrupt",
+      timeoutSeconds: 0,
+    });
+
+    expect(requireDetails(result)).toMatchObject({
+      runId: "gateway-replacement-run",
+      status: "accepted",
+      disposition: "interrupted",
+    });
+    expect(callGatewayMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "sessions.steer",
+      }),
+    );
+    expect(embeddedRunMock.abort).not.toHaveBeenCalled();
   });
 
   it("falls back to a new run when an active steer target finishes during admission", async () => {

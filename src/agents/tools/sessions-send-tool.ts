@@ -31,11 +31,13 @@ import {
 } from "../../utils/message-channel.js";
 import { listAgentIds } from "../agent-scope.js";
 import {
+  abortEmbeddedAgentRun,
   type EmbeddedAgentQueueMessageOptions,
   type EmbeddedAgentQueueMessageOutcome,
   formatEmbeddedAgentQueueFailureSummary,
   queueEmbeddedAgentMessageWithOutcomeAsync,
   resolveActiveEmbeddedRunSessionId,
+  waitForEmbeddedAgentRunEnd,
 } from "../embedded-agent-runner/runs.js";
 import { resolveNestedAgentLaneForSession } from "../lanes.js";
 import {
@@ -344,6 +346,23 @@ async function startAgentRun(params: {
     if (params.mode === "interrupt") {
       if (!messageText) {
         throw new Error("interrupt message is required");
+      }
+      const activeRunSessionId = resolveActiveEmbeddedRunSessionId(params.sessionKey);
+      if (activeRunSessionId && abortEmbeddedAgentRun(activeRunSessionId)) {
+        if (!(await waitForEmbeddedAgentRunEnd(activeRunSessionId, 15_000))) {
+          throw new Error(`Session ${params.sessionKey} is still active; try again in a moment.`);
+        }
+        const response = await params.callGateway<{ runId: string }>({
+          method: "agent",
+          params: params.sendParams,
+          timeoutMs: 10_000,
+        });
+        return {
+          ok: true,
+          runId:
+            typeof response?.runId === "string" && response.runId ? response.runId : params.runId,
+          disposition: "interrupted",
+        };
       }
       const response = await params.callGateway<{
         runId?: string;
