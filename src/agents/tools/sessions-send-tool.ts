@@ -31,11 +31,13 @@ import {
 } from "../../utils/message-channel.js";
 import { listAgentIds } from "../agent-scope.js";
 import {
+  abortEmbeddedAgentRun,
   type EmbeddedAgentQueueMessageOptions,
   type EmbeddedAgentQueueMessageOutcome,
   formatEmbeddedAgentQueueFailureSummary,
   queueEmbeddedAgentMessageWithOutcomeAsync,
   resolveActiveEmbeddedRunSessionId,
+  waitForEmbeddedAgentRunEnd,
 } from "../embedded-agent-runner/runs.js";
 import { resolveNestedAgentLaneForSession } from "../lanes.js";
 import {
@@ -66,8 +68,13 @@ const SessionsSendToolSchema = Type.Object({
   label: Type.Optional(Type.String({ minLength: 1, maxLength: SESSION_LABEL_MAX_LENGTH })),
   agentId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
   message: Type.String(),
+  mode: Type.Optional(Type.String({ enum: ["steer", "interrupt"] })),
   timeoutSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
   watch: Type.Optional(Type.Boolean()),
+});
+
+const SessionsSendDispositionSchema = Type.String({
+  enum: ["steered", "interrupted", "started"],
 });
 
 const SessionsSendDeliverySchema = Type.Object(
@@ -95,6 +102,7 @@ const SessionsSendOutputSchema = Type.Union([
       runId: Type.String(),
       status: Type.Literal("accepted"),
       sessionKey: Type.String(),
+      disposition: SessionsSendDispositionSchema,
       delivery: SessionsSendDeliverySchema,
       watched: Type.Optional(Type.Boolean()),
     },
@@ -117,6 +125,7 @@ const SessionsSendOutputSchema = Type.Union([
       runId: Type.String(),
       status: Type.Literal("ok"),
       sessionKey: Type.String(),
+      disposition: SessionsSendDispositionSchema,
       delivery: SessionsSendDeliverySchema,
       reply: Type.Optional(Type.String()),
       watched: Type.Optional(Type.Boolean()),
@@ -126,8 +135,21 @@ const SessionsSendOutputSchema = Type.Union([
 ]);
 
 type GatewayCaller = typeof callGateway;
+type SessionsSendMode = "steer" | "interrupt";
+type SessionsSendDisposition = "steered" | "interrupted" | "started";
 const SESSIONS_SEND_REPLY_HISTORY_LIMIT = 50;
 const SESSIONS_SEND_MESSAGE_ALIASES = ["SendMessage", "content", "text"] as const;
+
+function readSessionsSendMode(params: Record<string, unknown>): SessionsSendMode {
+  const mode = readStringParam(params, "mode");
+  if (!mode || mode === "steer") {
+    return "steer";
+  }
+  if (mode === "interrupt") {
+    return mode;
+  }
+  throw new Error('mode must be either "steer" or "interrupt"');
+}
 
 function normalizeSessionsSendArguments(args: unknown): Record<string, unknown> {
   const params =
@@ -304,12 +326,14 @@ async function startAgentRun(params: {
   runId: string;
   sendParams: Record<string, unknown>;
   sessionKey: string;
+  mode: SessionsSendMode;
   deliveryTimeoutMs?: number;
   allowActiveRunQueueDelivery?: boolean;
 }): Promise<
   | {
       ok: true;
       runId: string;
+      disposition: SessionsSendDisposition;
       activeRunQueue?: boolean;
       a2aSessionKey?: string;
       a2aDisplayKey?: string;
@@ -317,12 +341,54 @@ async function startAgentRun(params: {
   | { ok: false; result: ReturnType<typeof jsonResult> }
 > {
   try {
-    const activeRunSessionId =
-      params.allowActiveRunQueueDelivery && isRunScopedAgentSessionKey(params.sessionKey)
-        ? resolveActiveEmbeddedRunSessionId(params.sessionKey)
-        : undefined;
     const messageText =
       typeof params.sendParams.message === "string" ? params.sendParams.message : undefined;
+    if (params.mode === "interrupt") {
+      if (!messageText) {
+        throw new Error("interrupt message is required");
+      }
+      const activeRunSessionId = resolveActiveEmbeddedRunSessionId(params.sessionKey);
+      if (activeRunSessionId && abortEmbeddedAgentRun(activeRunSessionId)) {
+        if (!(await waitForEmbeddedAgentRunEnd(activeRunSessionId, 15_000))) {
+          throw new Error(`Session ${params.sessionKey} is still active; try again in a moment.`);
+        }
+        const response = await params.callGateway<{ runId: string }>({
+          method: "agent",
+          params: params.sendParams,
+          timeoutMs: 10_000,
+        });
+        return {
+          ok: true,
+          runId:
+            typeof response?.runId === "string" && response.runId ? response.runId : params.runId,
+          disposition: "interrupted",
+        };
+      }
+      const response = await params.callGateway<{
+        runId?: string;
+        interruptedActiveRun?: boolean;
+      }>({
+        method: "sessions.steer",
+        params: {
+          key: params.sessionKey,
+          message: messageText,
+          idempotencyKey: params.runId,
+        },
+        timeoutMs: 10_000,
+      });
+      return {
+        ok: true,
+        runId:
+          typeof response?.runId === "string" && response.runId ? response.runId : params.runId,
+        disposition: response?.interruptedActiveRun === true ? "interrupted" : "started",
+      };
+    }
+
+    const activeRunSessionId =
+      params.mode === "steer" ||
+      (params.allowActiveRunQueueDelivery && isRunScopedAgentSessionKey(params.sessionKey))
+        ? resolveActiveEmbeddedRunSessionId(params.sessionKey)
+        : undefined;
     if (activeRunSessionId && messageText) {
       const sourceReplyDeliveryMode =
         params.sendParams.sourceReplyDeliveryMode === "automatic" ||
@@ -351,7 +417,12 @@ async function startAgentRun(params: {
         );
       }
       if (queueOutcome.queued) {
-        return { ok: true, runId: params.runId, activeRunQueue: true };
+        return {
+          ok: true,
+          runId: params.runId,
+          disposition: "steered",
+          activeRunQueue: true,
+        };
       }
       const fallbackSessionKey = resolveCronRunScopedFallbackSessionKey(params.sessionKey);
       if (fallbackSessionKey && shouldFallbackCronRunScopedActiveDelivery(queueOutcome)) {
@@ -368,13 +439,16 @@ async function startAgentRun(params: {
           ok: true,
           runId:
             typeof response?.runId === "string" && response.runId ? response.runId : params.runId,
+          disposition: "started",
           a2aSessionKey: fallbackSessionKey,
           a2aDisplayKey: fallbackSessionKey,
         };
       }
-      const queueSummary =
-        formatEmbeddedAgentQueueFailureSummary(queueOutcome) ?? "active run queue rejected";
-      throw new Error(queueSummary);
+      if (!shouldFallbackCronRunScopedActiveDelivery(queueOutcome)) {
+        const queueSummary =
+          formatEmbeddedAgentQueueFailureSummary(queueOutcome) ?? "active run queue rejected";
+        throw new Error(queueSummary);
+      }
     }
     const response = await params.callGateway<{ runId: string }>({
       method: "agent",
@@ -384,6 +458,7 @@ async function startAgentRun(params: {
     return {
       ok: true,
       runId: typeof response?.runId === "string" && response.runId ? response.runId : params.runId,
+      disposition: "started",
     };
   } catch (err) {
     const messageText =
@@ -419,6 +494,7 @@ export function createSessionsSendTool(opts?: {
       const params = normalizeSessionsSendArguments(args);
       const gatewayCall = opts?.callGateway ?? callGateway;
       const message = readStringParam(params, "message", { required: true });
+      const mode = readSessionsSendMode(params);
       const timeoutSeconds = readNonNegativeIntegerParam(params, "timeoutSeconds") ?? 30;
       const { cfg, mainKey, alias, effectiveRequesterKey, restrictToSpawned } =
         resolveSessionToolContext(opts);
@@ -780,6 +856,7 @@ export function createSessionsSendTool(opts?: {
           runId,
           sendParams,
           sessionKey: displayKey,
+          mode,
           deliveryTimeoutMs: announceTimeoutMs,
           allowActiveRunQueueDelivery: true,
         });
@@ -795,6 +872,7 @@ export function createSessionsSendTool(opts?: {
           runId,
           status: "accepted",
           sessionKey: displayKey,
+          disposition: start.disposition,
           delivery,
           ...watchField,
         });
@@ -805,6 +883,7 @@ export function createSessionsSendTool(opts?: {
         runId,
         sendParams,
         sessionKey: displayKey,
+        mode,
         deliveryTimeoutMs: announceTimeoutMs,
       });
       if (!start.ok) {
@@ -812,6 +891,16 @@ export function createSessionsSendTool(opts?: {
       }
       runId = start.runId;
       const watchField = registerWatchIfRequested(resolvedKey);
+      if (start.activeRunQueue) {
+        return jsonResult({
+          runId,
+          status: "accepted",
+          sessionKey: displayKey,
+          disposition: start.disposition,
+          delivery,
+          ...watchField,
+        });
+      }
       const result = await waitForAgentRunAndReadUpdatedAssistantReply({
         runId,
         sessionKey: resolvedKey,
@@ -840,6 +929,7 @@ export function createSessionsSendTool(opts?: {
             runId,
             status: "accepted",
             sessionKey: displayKey,
+            disposition: start.disposition,
             delivery,
             ...watchField,
           });
@@ -870,6 +960,7 @@ export function createSessionsSendTool(opts?: {
         runId,
         status: "ok",
         sessionKey: displayKey,
+        disposition: start.disposition,
         delivery,
         ...(typeof reply === "string" ? { reply } : {}),
         ...watchField,

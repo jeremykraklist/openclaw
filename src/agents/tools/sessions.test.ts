@@ -10,6 +10,12 @@ import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { extractAssistantText, sanitizeTextContent } from "./chat-history-text.js";
 
 const callGatewayMock = vi.fn();
+const embeddedRunMock = vi.hoisted(() => ({
+  abort: vi.fn(),
+  queueMessage: vi.fn(),
+  resolveActiveSessionId: vi.fn(),
+  waitForEnd: vi.fn(),
+}));
 const facadeRuntimeMock = vi.hoisted(() => ({
   sessionKeyResolvers: new Map<
     string,
@@ -25,6 +31,18 @@ const facadeRuntimeMock = vi.hoisted(() => ({
 vi.mock("../../gateway/call.js", () => ({
   callGateway: (opts: unknown) => callGatewayMock(opts),
 }));
+vi.mock("../embedded-agent-runner/runs.js", async () => {
+  const actual = await vi.importActual<typeof import("../embedded-agent-runner/runs.js")>(
+    "../embedded-agent-runner/runs.js",
+  );
+  return {
+    ...actual,
+    abortEmbeddedAgentRun: embeddedRunMock.abort,
+    queueEmbeddedAgentMessageWithOutcomeAsync: embeddedRunMock.queueMessage,
+    resolveActiveEmbeddedRunSessionId: embeddedRunMock.resolveActiveSessionId,
+    waitForEmbeddedAgentRunEnd: embeddedRunMock.waitForEnd,
+  };
+});
 vi.mock("../../plugin-sdk/facade-runtime.js", async () => {
   const actual = await vi.importActual<typeof import("../../plugin-sdk/facade-runtime.js")>(
     "../../plugin-sdk/facade-runtime.js",
@@ -309,6 +327,10 @@ describe("sanitizeTextContent", () => {
 });
 
 beforeEach(() => {
+  embeddedRunMock.queueMessage.mockReset();
+  embeddedRunMock.resolveActiveSessionId.mockReset();
+  embeddedRunMock.abort.mockReset();
+  embeddedRunMock.waitForEnd.mockReset();
   facadeRuntimeMock.sessionKeyResolvers.clear();
   loadConfigMock.mockReset();
   loadConfigMock.mockReturnValue({
@@ -738,6 +760,281 @@ describe("sessions_send gating", () => {
       }),
     ).rejects.toThrow("timeoutSeconds must be a non-negative integer");
     expect(callGatewayMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid delivery mode before gateway work", async () => {
+    const tool = createMainSessionsSendTool();
+
+    await expect(
+      tool.execute("call-invalid-mode", {
+        sessionKey: MAIN_AGENT_SESSION_KEY,
+        message: "hi",
+        mode: "later",
+      }),
+    ).rejects.toThrow('mode must be either "steer" or "interrupt"');
+    expect(callGatewayMock).not.toHaveBeenCalled();
+  });
+
+  it("steers an active normal session by default with transcript-commit acknowledgement", async () => {
+    const targetSessionKey = "agent:main:slack:channel:ops";
+    embeddedRunMock.resolveActiveSessionId.mockReturnValue("active-target-session-id");
+    embeddedRunMock.queueMessage.mockResolvedValue({
+      queued: true,
+      sessionId: "active-target-session-id",
+      target: "embedded_run",
+      gatewayHealth: "live",
+      deliveredAtMs: 123,
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [{ key: targetSessionKey, kind: "group" }],
+        };
+      }
+      if (request.method === "chat.history") {
+        return { messages: [] };
+      }
+      throw new Error(`unexpected gateway method: ${request.method}`);
+    });
+    const tool = createSessionsSendTool({
+      agentSessionKey: MAIN_AGENT_SESSION_KEY,
+      agentChannel: MAIN_AGENT_CHANNEL,
+      config: {
+        session: { scope: "per-sender", mainKey: "main" },
+        tools: {
+          agentToAgent: { enabled: false },
+          sessions: { visibility: "all" },
+        },
+      } as never,
+      callGateway: callGatewayMock,
+    });
+
+    const result = await tool.execute("call-active-steer", {
+      sessionKey: targetSessionKey,
+      message: "use the corrected deadline",
+      timeoutSeconds: 5,
+    });
+
+    expect(requireDetails(result)).toMatchObject({
+      status: "accepted",
+      sessionKey: targetSessionKey,
+      disposition: "steered",
+    });
+    expect(embeddedRunMock.resolveActiveSessionId).toHaveBeenCalledWith(targetSessionKey);
+    expect(embeddedRunMock.queueMessage).toHaveBeenCalledWith(
+      "active-target-session-id",
+      expect.stringContaining("use the corrected deadline"),
+      expect.objectContaining({
+        steeringMode: "all",
+        debounceMs: 0,
+        waitForTranscriptCommit: true,
+      }),
+    );
+    expect(callGatewayMock).not.toHaveBeenCalledWith(expect.objectContaining({ method: "agent" }));
+  });
+
+  it("starts a new run when the default steer target is idle", async () => {
+    const targetSessionKey = "agent:main:slack:channel:ops";
+    embeddedRunMock.resolveActiveSessionId.mockReturnValue(undefined);
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [{ key: targetSessionKey, kind: "group" }],
+        };
+      }
+      if (request.method === "agent") {
+        return { runId: "new-target-run" };
+      }
+      throw new Error(`unexpected gateway method: ${request.method}`);
+    });
+    const tool = createSessionsSendTool({
+      agentSessionKey: MAIN_AGENT_SESSION_KEY,
+      agentChannel: MAIN_AGENT_CHANNEL,
+      config: {
+        session: { scope: "per-sender", mainKey: "main" },
+        tools: {
+          agentToAgent: { enabled: false },
+          sessions: { visibility: "all" },
+        },
+      } as never,
+      callGateway: callGatewayMock,
+    });
+
+    const result = await tool.execute("call-idle-steer", {
+      sessionKey: targetSessionKey,
+      message: "start this task",
+      timeoutSeconds: 0,
+    });
+
+    expect(requireDetails(result)).toMatchObject({
+      runId: "new-target-run",
+      status: "accepted",
+      disposition: "started",
+    });
+    expect(callGatewayMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "agent",
+        params: expect.objectContaining({ sessionKey: targetSessionKey }),
+      }),
+    );
+  });
+
+  it("interrupts and replaces an active run only when explicitly requested", async () => {
+    const targetSessionKey = "agent:main:slack:channel:ops";
+    embeddedRunMock.resolveActiveSessionId.mockReturnValue("active-target-session-id");
+    embeddedRunMock.abort.mockReturnValue(true);
+    embeddedRunMock.waitForEnd.mockResolvedValue(true);
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [{ key: targetSessionKey, kind: "group" }],
+        };
+      }
+      if (request.method === "agent") {
+        return { runId: "replacement-run" };
+      }
+      throw new Error(`unexpected gateway method: ${request.method}`);
+    });
+    const tool = createSessionsSendTool({
+      agentSessionKey: MAIN_AGENT_SESSION_KEY,
+      agentChannel: MAIN_AGENT_CHANNEL,
+      config: {
+        session: { scope: "per-sender", mainKey: "main" },
+        tools: {
+          agentToAgent: { enabled: false },
+          sessions: { visibility: "all" },
+        },
+      } as never,
+      callGateway: callGatewayMock,
+    });
+
+    const result = await tool.execute("call-interrupt", {
+      sessionKey: targetSessionKey,
+      message: "stop the old task and do this instead",
+      mode: "interrupt",
+      timeoutSeconds: 0,
+    });
+
+    expect(requireDetails(result)).toMatchObject({
+      runId: "replacement-run",
+      status: "accepted",
+      disposition: "interrupted",
+    });
+    expect(callGatewayMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "agent",
+        params: expect.objectContaining({
+          message: expect.stringContaining("stop the old task and do this instead"),
+          sessionKey: targetSessionKey,
+        }),
+      }),
+    );
+    expect(embeddedRunMock.abort).toHaveBeenCalledWith("active-target-session-id");
+    expect(embeddedRunMock.waitForEnd).toHaveBeenCalledWith("active-target-session-id", 15_000);
+    expect(embeddedRunMock.queueMessage).not.toHaveBeenCalled();
+  });
+
+  it("uses the gateway interrupt path when no embedded run is active", async () => {
+    const targetSessionKey = "agent:main:slack:channel:ops";
+    embeddedRunMock.resolveActiveSessionId.mockReturnValue(undefined);
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [{ key: targetSessionKey, kind: "group" }],
+        };
+      }
+      if (request.method === "sessions.steer") {
+        return { runId: "gateway-replacement-run", interruptedActiveRun: true };
+      }
+      throw new Error(`unexpected gateway method: ${request.method}`);
+    });
+    const tool = createSessionsSendTool({
+      agentSessionKey: MAIN_AGENT_SESSION_KEY,
+      agentChannel: MAIN_AGENT_CHANNEL,
+      config: {
+        session: { scope: "per-sender", mainKey: "main" },
+        tools: {
+          agentToAgent: { enabled: false },
+          sessions: { visibility: "all" },
+        },
+      } as never,
+      callGateway: callGatewayMock,
+    });
+
+    const result = await tool.execute("call-gateway-interrupt", {
+      sessionKey: targetSessionKey,
+      message: "replace the non-embedded run",
+      mode: "interrupt",
+      timeoutSeconds: 0,
+    });
+
+    expect(requireDetails(result)).toMatchObject({
+      runId: "gateway-replacement-run",
+      status: "accepted",
+      disposition: "interrupted",
+    });
+    expect(callGatewayMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "sessions.steer",
+      }),
+    );
+    expect(embeddedRunMock.abort).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a new run when an active steer target finishes during admission", async () => {
+    const targetSessionKey = "agent:main:slack:channel:ops";
+    embeddedRunMock.resolveActiveSessionId.mockReturnValue("ending-target-session-id");
+    embeddedRunMock.queueMessage.mockResolvedValue({
+      queued: false,
+      sessionId: "ending-target-session-id",
+      reason: "no_active_run",
+      gatewayHealth: "live",
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [{ key: targetSessionKey, kind: "group" }],
+        };
+      }
+      if (request.method === "agent") {
+        return { runId: "race-fallback-run" };
+      }
+      throw new Error(`unexpected gateway method: ${request.method}`);
+    });
+    const tool = createSessionsSendTool({
+      agentSessionKey: MAIN_AGENT_SESSION_KEY,
+      agentChannel: MAIN_AGENT_CHANNEL,
+      config: {
+        session: { scope: "per-sender", mainKey: "main" },
+        tools: {
+          agentToAgent: { enabled: false },
+          sessions: { visibility: "all" },
+        },
+      } as never,
+      callGateway: callGatewayMock,
+    });
+
+    const result = await tool.execute("call-steer-race", {
+      sessionKey: targetSessionKey,
+      message: "continue as a new turn if needed",
+      timeoutSeconds: 0,
+    });
+
+    expect(requireDetails(result)).toMatchObject({
+      runId: "race-fallback-run",
+      status: "accepted",
+      disposition: "started",
+    });
   });
 
   it("returns an error when label resolution fails", async () => {
