@@ -43,6 +43,8 @@ export function describeSessionsSearchTool(): string {
 export function describeSessionsSendTool(): string {
   return [
     "Run a visible session on this Gateway by sessionKey/label, or a configured local agent by agentId; sessionKey wins redundant label.",
+    '`mode="steer"` is the default: inject into an active run with transcript-commit acknowledgement, or start the target when idle.',
+    '`mode="interrupt"` aborts/replaces active work; use only when the newer instruction supersedes or stops it.',
     "A session identifies model context, not an external address; its reply may still announce through established delivery context.",
     "For an exact external destination, use `conversations_list` plus `conversations_send`/`conversations_turn`, or `message` with an explicit channel and target.",
     "Thread chats rejected: target parent channel. Missing configured-agent main created. Waits for reply when available.",
