@@ -2261,6 +2261,69 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  it("retries active requester completion wake without message-tool ownership when the live run owns automatic delivery", async () => {
+    const callGateway = createGatewayMock();
+    const queueEmbeddedPiMessageWithOutcome = createQueueOutcomeSequenceMock([
+      "source_reply_delivery_mode_mismatch",
+      true,
+    ]);
+    const sendMessage = createSendMessageMock();
+    const result = await deliverSlackChannelAnnouncement({
+      callGateway,
+      sendMessage,
+      sessionId: "requester-session-channel",
+      isActive: true,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-channel-active-mode-mismatch",
+      sourceTool: "subagent_announce",
+      queueEmbeddedPiMessageWithOutcome,
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "channel completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "child completion output",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "steered",
+    });
+    expect(queueEmbeddedPiMessageWithOutcome).toHaveBeenNthCalledWith(
+      1,
+      "requester-session-channel",
+      "child done",
+      {
+        steeringMode: "all",
+        sourceReplyDeliveryMode: "message_tool_only",
+        debounceMs: 500,
+        waitForTranscriptCommit: true,
+        deliveryTimeoutMs: 120_000,
+      },
+    );
+    expect(queueEmbeddedPiMessageWithOutcome).toHaveBeenNthCalledWith(
+      2,
+      "requester-session-channel",
+      "child done",
+      {
+        steeringMode: "all",
+        debounceMs: 500,
+        waitForTranscriptCommit: true,
+        deliveryTimeoutMs: 120_000,
+      },
+    );
+    expect(callGateway).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       name: "legacy Discord channel",

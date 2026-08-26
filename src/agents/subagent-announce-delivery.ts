@@ -858,20 +858,34 @@ async function sendSubagentAnnounceDirectly(params: {
           : {}),
         waitForTranscriptCommit: true,
       };
-      let wakeOutcome = await resolveQueueEmbeddedPiMessageOutcome(
-        requesterActivity.sessionId,
-        params.triggerMessage,
-        wakeOptions,
-      );
-      if (!wakeOutcome.queued && wakeOutcome.reason === "transcript_commit_wait_unsupported") {
-        const bestEffortWakeOptions = { ...wakeOptions };
+      const requesterSessionId = requesterActivity.sessionId;
+      const queueWake = async (options: EmbeddedPiQueueMessageOptions) =>
+        await resolveQueueEmbeddedPiMessageOutcome(
+          requesterSessionId,
+          params.triggerMessage,
+          options,
+        );
+      const retryWithoutTranscriptWait = async (options: EmbeddedPiQueueMessageOptions) => {
+        const bestEffortWakeOptions = { ...options };
         delete bestEffortWakeOptions.waitForTranscriptCommit;
         completionWakeRetriedWithoutTranscriptWait = true;
-        wakeOutcome = await resolveQueueEmbeddedPiMessageOutcome(
-          requesterActivity.sessionId,
-          params.triggerMessage,
-          bestEffortWakeOptions,
-        );
+        return await queueWake(bestEffortWakeOptions);
+      };
+      let wakeOutcome = await queueWake(wakeOptions);
+      if (!wakeOutcome.queued && wakeOutcome.reason === "transcript_commit_wait_unsupported") {
+        wakeOutcome = await retryWithoutTranscriptWait(wakeOptions);
+      }
+      if (
+        !wakeOutcome.queued &&
+        wakeOutcome.reason === "source_reply_delivery_mode_mismatch" &&
+        wakeOptions.sourceReplyDeliveryMode === "message_tool_only"
+      ) {
+        const activeRunOwnedWakeOptions = { ...wakeOptions };
+        delete activeRunOwnedWakeOptions.sourceReplyDeliveryMode;
+        wakeOutcome = await queueWake(activeRunOwnedWakeOptions);
+        if (!wakeOutcome.queued && wakeOutcome.reason === "transcript_commit_wait_unsupported") {
+          wakeOutcome = await retryWithoutTranscriptWait(activeRunOwnedWakeOptions);
+        }
       }
       if (wakeOutcome.queued) {
         return {
